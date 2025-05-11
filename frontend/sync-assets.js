@@ -3,6 +3,36 @@ var fs = require('fs');
 var crypto = require('crypto');
 var path = require('node:path');
 const LOG_TAG = '[sync-assets]';
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, filename, maxRetries = 5) {
+  let attempt = 0;
+  let delay = 1000;
+
+  while (attempt <= maxRetries) {
+    await sleep(300); // throttle between downloads
+
+    const response = await new Promise((resolve, reject) => {
+      https.get(url, (res) => resolve(res)).on('error', reject);
+    });
+
+    if (response.statusCode === 200) {
+      return response;
+    } else if (response.statusCode === 429 && attempt < maxRetries) {
+      console.warn(`[sync-assets] HTTP 429 for ${filename}. Retrying in ${delay}ms...`);
+      await sleep(delay);
+      attempt++;
+      delay *= 2;
+    } else {
+      throw new Error(`HTTP Error ${response.statusCode} while fetching '${filename}'`);
+    }
+  }
+}
+
+
 let verbose = false;
 let MEMPOOL_CDN = false;
 let DRY_RUN = false;
@@ -61,20 +91,18 @@ try {
 }
 
 function download(filename, url) {
-  https.get(url, (response) => {
-    if (response.statusCode < 200 || response.statusCode > 299) {
-      throw new Error('HTTP Error ' + response.statusCode + ' while fetching \'' + filename + '\'');
-    }
-    response.pipe(fs.createWriteStream(filename));
-  })
-  .on('error', function(e) {
-    throw new Error(e);
-  })
-  .on('finish', () => {
-    if (verbose) {
-      console.log(`${LOG_TAG} \tFinished downloading ${url} to ${filename}`);
-    }
-  });
+  return fetchWithRetry(url, filename)
+    .then((response) => {
+      return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(filename);
+        response.pipe(file);
+        file.on('finish', () => file.close(resolve));
+        file.on('error', reject);
+      });
+    })
+    .catch((err) => {
+      console.warn(`${LOG_TAG} Failed to download ${filename}: ${err.message}`);
+    });
 }
 
 function getLocalHash(filePath) {
@@ -117,69 +145,73 @@ function downloadMiningPoolLogos$() {
         const response_body = Buffer.concat(chunks_of_data);
         try {
           const poolLogos = JSON.parse(response_body.toString());
-          if (poolLogos.message) {
-            reject(poolLogos.message);
-          }
+          if (poolLogos.message) return reject(poolLogos.message);
+
           let downloadedCount = 0;
-          for (const poolLogo of poolLogos) {
-            if (verbose) {
-              console.log(`${LOG_TAG} Processing ${poolLogo.name}`);
-            }
-            console.log(`${ASSETS_PATH}/mining-pools/${poolLogo.name}`);
-            const filePath = `${ASSETS_PATH}/mining-pools/${poolLogo.name}`;
-            if (fs.existsSync(filePath)) {
-              const localHash = getLocalHash(filePath);
+
+          poolLogos.reduce((promiseChain, poolLogo) => {
+            return promiseChain.then(() => {
               if (verbose) {
-                console.log(`${LOG_TAG} \t\tremote ${poolLogo.name} logo hash ${poolLogo.sha}`);
-                console.log(`${LOG_TAG} \t\t\tchecking if ${filePath} exists: ${fs.existsSync(filePath)}`);
+                console.log(`${LOG_TAG} Processing ${poolLogo.name}`);
               }
-              if (localHash !== poolLogo.sha) {
-                console.log(`${LOG_TAG} \t\t\t\t${poolLogo.name} is different on the remote, downloading...`);
-                let download_url = poolLogo.download_url;
-                if (MEMPOOL_CDN) {
-                  download_url = download_url.replace("raw.githubusercontent.com/mempool/mining-pool-logos/master", "mempool.space/resources/mining-pools");
+
+              const filePath = `${ASSETS_PATH}/mining-pools/${poolLogo.name}`;
+              let download_url = poolLogo.download_url;
+
+              if (MEMPOOL_CDN) {
+                download_url = download_url.replace(
+                  "raw.githubusercontent.com/mempool/mining-pool-logos/master",
+                  "mempool.space/resources/mining-pools"
+                );
+              }
+
+              const miningPoolsDir = `${ASSETS_PATH}/mining-pools/`;
+              if (!fs.existsSync(miningPoolsDir)) {
+                fs.mkdirSync(miningPoolsDir, { recursive: true });
+              }
+
+              const fileExists = fs.existsSync(filePath);
+              const needsUpdate = fileExists && getLocalHash(filePath) !== poolLogo.sha;
+
+              if (fileExists) {
+                if (verbose) {
+                  console.log(`${LOG_TAG} \t\tremote ${poolLogo.name} logo hash ${poolLogo.sha}`);
+                  console.log(`${LOG_TAG} \t\t\tchecking if ${filePath} exists: ${fileExists}`);
                 }
+              }
+
+              if (!fileExists || needsUpdate) {
+                console.log(`${LOG_TAG} \t\t${fileExists ? 'Updating' : 'Downloading'} ${poolLogo.name}...`);
+
                 if (DRY_RUN) {
                   console.log(`${LOG_TAG} \t\tDRY_RUN is set, not downloading ${poolLogo.name} but we should`);
+                  return Promise.resolve();
                 } else {
                   if (verbose) {
                     console.log(`${LOG_TAG} \t\tDownloading ${download_url} to ${filePath}`);
                   }
-                  download(filePath, download_url);
-                  downloadedCount++;
+                  return download(filePath, download_url).then(() => {
+                    downloadedCount++;
+                  });
                 }
               } else {
                 console.log(`${LOG_TAG} \t\t${poolLogo.name} is already up to date. Skipping.`);
+                return Promise.resolve();
               }
-            } else {
-              console.log(`${LOG_TAG} \t\t${poolLogo.name} is missing, downloading...`);
-              const miningPoolsDir = `${ASSETS_PATH}/mining-pools/`;
-              if (!fs.existsSync(miningPoolsDir)){
-                fs.mkdirSync(miningPoolsDir, { recursive: true });
-              }
-              let download_url = poolLogo.download_url;
-              if (MEMPOOL_CDN) {
-                download_url = download_url.replace("raw.githubusercontent.com/mempool/mining-pool-logos/master", "mempool.space/resources/mining-pools");
-              }
-              if (DRY_RUN) {
-                console.log(`${LOG_TAG} DRY_RUN is set, not downloading ${poolLogo.name} but it should`);
-              } else {
-                console.log(`${LOG_TAG} \tDownloading ${download_url} to ${filePath}`);
-                download(filePath, download_url);
-                downloadedCount++;
-              }
-            }
-          }
-          console.log(`${LOG_TAG} \t\tDownloaded ${downloadedCount} and skipped ${poolLogos.length - downloadedCount} existing mining pool logos`);
-          resolve();
+            });
+          }, Promise.resolve())
+            .then(() => {
+              console.log(`${LOG_TAG} \t\tDownloaded ${downloadedCount} and skipped ${poolLogos.length - downloadedCount} existing mining pool logos`);
+              resolve();
+            })
+            .catch(reject);
+
         } catch (e) {
-          reject(`Unable to download mining pool logos. Trying again at next restart. Reason: ${e instanceof Error ? e.message : e}`);
+          reject(`Unable to download mining pool logos: ${e instanceof Error ? e.message : e}`);
         }
       });
 
-      response.on('error', (error) => {
-        reject(error);
-      });
+      response.on('error', reject);
     });
   });
 }
@@ -191,7 +223,7 @@ function downloadPromoVideoSubtiles$() {
       host: 'api.github.com',
       path: '/repos/mempool/mempool-promo/contents/subtitles',
       method: 'GET',
-      headers: {'user-agent': 'node.js'}
+      headers: { 'user-agent': 'node.js' }
     };
 
     if (githubSecret) {
@@ -199,7 +231,6 @@ function downloadPromoVideoSubtiles$() {
       options.headers['authorization'] = `Bearer ${githubSecret}`;
       options.headers['X-GitHub-Api-Version'] = '2022-11-28';
     }
-
 
     https.get(options, (response) => {
       const chunks_of_data = [];
@@ -212,70 +243,71 @@ function downloadPromoVideoSubtiles$() {
         const response_body = Buffer.concat(chunks_of_data);
         try {
           const videoLanguages = JSON.parse(response_body.toString());
-          if (videoLanguages.message) {
-            reject(videoLanguages.message);
-          }
+          if (videoLanguages.message) return reject(videoLanguages.message);
+
           let downloadedCount = 0;
-          for (const language of videoLanguages) {
-            if (verbose) {
-              console.log(`${LOG_TAG} Processing ${language.name}`);
-            }
-            const filePath = `${ASSETS_PATH}/promo-video/${language.name}`;
-            if (fs.existsSync(filePath)) {
+
+          videoLanguages.reduce((promiseChain, language) => {
+            return promiseChain.then(() => {
               if (verbose) {
-                console.log(`${LOG_TAG} \t${language.name} remote promo video hash ${language.sha}`);
+                console.log(`${LOG_TAG} Processing ${language.name}`);
               }
-              const localHash = getLocalHash(filePath);
-              if (localHash !== language.sha) {
-                console.log(`${LOG_TAG} \t\t${language.name} is different on the remote, updating`);
-                let download_url = language.download_url;
-                if (MEMPOOL_CDN) {
-                  download_url = download_url.replace("raw.githubusercontent.com/mempool/mempool-promo/master/subtitles", "mempool.space/resources/promo-video");
+
+              const filePath = `${ASSETS_PATH}/promo-video/${language.name}`;
+              let download_url = language.download_url;
+
+              if (MEMPOOL_CDN) {
+                download_url = download_url.replace(
+                  "raw.githubusercontent.com/mempool/mempool-promo/master/subtitles",
+                  "mempool.space/resources/promo-video"
+                );
+              }
+
+              const promoDir = `${ASSETS_PATH}/promo-video/`;
+              if (!fs.existsSync(promoDir)) {
+                fs.mkdirSync(promoDir, { recursive: true });
+              }
+
+              const fileExists = fs.existsSync(filePath);
+              const needsUpdate = fileExists && getLocalHash(filePath) !== language.sha;
+
+              if (fileExists) {
+                if (verbose) {
+                  console.log(`${LOG_TAG} \t${language.name} remote promo video hash ${language.sha}`);
                 }
+              }
+
+              if (!fileExists || needsUpdate) {
+                console.log(`${LOG_TAG} \t\t${fileExists ? 'Updating' : 'Downloading'} ${language.name}`);
+
                 if (DRY_RUN) {
                   console.log(`${LOG_TAG} \t\tDRY_RUN is set, not downloading ${language.name} but we should`);
+                  return Promise.resolve();
                 } else {
                   if (verbose) {
                     console.log(`${LOG_TAG} \t\tdownloading ${download_url} to ${filePath}`);
                   }
-                  download(filePath, download_url);
-                  downloadedCount++;
+                  return download(filePath, download_url).then(() => {
+                    downloadedCount++;
+                  });
                 }
               } else {
                 console.log(`${LOG_TAG} \t\t${language.name} is already up to date. Skipping.`);
+                return Promise.resolve();
               }
-            } else {
-              console.log(`${LOG_TAG} \t\t${language.name} is missing, downloading`);
-              const promoVideosDir = `${ASSETS_PATH}/promo-video/`;
-              if (!fs.existsSync(promoVideosDir)){
-                fs.mkdirSync(promoVideosDir, { recursive: true });
-              }
-
-              let download_url = language.download_url;
-              if (MEMPOOL_CDN) {
-                download_url = downloadownload_url = download_url.replace("raw.githubusercontent.com/mempool/mempool-promo/master/subtitles", "mempool.space/resources/promo-video");
-              }
-              if (DRY_RUN) {
-                console.log(`${LOG_TAG} \tDRY_RUN is set, not downloading ${language.name} but we should`);
-              } else {
-                if (verbose) {
-                  console.log(`${LOG_TAG} downloading ${download_url} to ${filePath}`);
-                }
-                download(filePath, download_url);
-                downloadedCount++;
-              }
-            }
-          }
-          console.log(`${LOG_TAG} Downloaded ${downloadedCount} and skipped ${videoLanguages.length - downloadedCount} existing video subtitles`);
-          resolve();
+            });
+          }, Promise.resolve())
+            .then(() => {
+              console.log(`${LOG_TAG} Downloaded ${downloadedCount} and skipped ${videoLanguages.length - downloadedCount} existing video subtitles`);
+              resolve();
+            })
+            .catch(reject);
         } catch (e) {
           reject(`Unable to download video subtitles. Trying again at next restart. Reason: ${e instanceof Error ? e.message : e}`);
         }
       });
 
-      response.on('error', (error) => {
-        reject(error);
-      });
+      response.on('error', reject);
     });
   });
 }
@@ -287,7 +319,7 @@ function downloadPromoVideo$() {
       host: 'api.github.com',
       path: '/repos/mempool/mempool-promo/contents',
       method: 'GET',
-      headers: {'user-agent': 'node.js'}
+      headers: { 'user-agent': 'node.js' }
     };
 
     if (githubSecret) {
@@ -307,65 +339,69 @@ function downloadPromoVideo$() {
         const response_body = Buffer.concat(chunks_of_data);
         try {
           const contents = JSON.parse(response_body.toString());
-          if (contents.message) {
-            reject(contents.message);
-          }
-          for (const item of contents) {
-            if (item.name !== 'promo.mp4') {
-              continue;
-            }
-            const filePath = `${ASSETS_PATH}/promo-video/mempool-promo.mp4`;
-            if (fs.existsSync(filePath)) {
-              const localHash = getLocalHash(filePath);
+          if (contents.message) return reject(contents.message);
 
-              if (localHash !== item.sha) {
-                console.log(`${LOG_TAG} \tmempool-promo.mp4 is different on the remote, updating`);
-                let download_url = item.download_url;
-                if (MEMPOOL_CDN) {
-                  download_url = download_url.replace("raw.githubusercontent.com/mempool/mempool-promo/master/promo.mp4", "mempool.space/resources/promo-video/mempool-promo.mp4");
-                }
-                if (DRY_RUN) {
-                  console.log(`${LOG_TAG} DRY_RUN is set, not downloading mempool-promo.mp4 but we should`);
+          contents.reduce((promiseChain, item) => {
+            return promiseChain.then(() => {
+              if (item.name !== 'promo.mp4') {
+                return Promise.resolve();
+              }
+
+              const filePath = `${ASSETS_PATH}/promo-video/mempool-promo.mp4`;
+              let download_url = item.download_url;
+
+              if (MEMPOOL_CDN) {
+                download_url = download_url.replace(
+                  "raw.githubusercontent.com/mempool/mempool-promo/master/promo.mp4",
+                  "mempool.space/resources/promo-video/mempool-promo.mp4"
+                );
+              }
+
+              const promoDir = `${ASSETS_PATH}/promo-video/`;
+              if (!fs.existsSync(promoDir)) {
+                fs.mkdirSync(promoDir, { recursive: true });
+              }
+
+              const fileExists = fs.existsSync(filePath);
+              const needsUpdate = fileExists && getLocalHash(filePath) !== item.sha;
+
+              if (fileExists) {
+                if (needsUpdate) {
+                  console.log(`${LOG_TAG} \tmempool-promo.mp4 is different on the remote, updating`);
                 } else {
-                  if (verbose) {
-                    console.log(`${LOG_TAG} downloading ${download_url} to ${filePath}`);
-                  }
-                  download(filePath, download_url);
-                  console.log(`${LOG_TAG} \tmempool-promo.mp4 downloaded.`);
+                  console.log(`${LOG_TAG} \t\tmempool-promo.mp4 is already up to date. Skipping.`);
+                  return Promise.resolve();
                 }
               } else {
-                console.log(`${LOG_TAG} \t\tmempool-promo.mp4 is already up to date. Skipping.`);
+                console.log(`${LOG_TAG} \tmempool-promo.mp4 is missing, downloading`);
               }
-            } else {
-              console.log(`${LOG_TAG} \tmempool-promo.mp4 is missing, downloading`);
-              let download_url = item.download_url;
-              if (MEMPOOL_CDN) {
-                download_url = download_url.replace("raw.githubusercontent.com/mempool/mempool-promo/master/promo.mp4", "mempool.space/resources/promo-video/mempool-promo.mp4");
-              }
+
               if (DRY_RUN) {
                 console.log(`${LOG_TAG} DRY_RUN is set, not downloading mempool-promo.mp4 but we should`);
-              } else {
-                if (verbose) {
-                  console.log(`${LOG_TAG} downloading ${download_url} to ${filePath}`);
-                }
-                download(filePath, download_url);
+                return Promise.resolve();
               }
-            }
-          }
-          resolve();
+
+              if (verbose) {
+                console.log(`${LOG_TAG} downloading ${download_url} to ${filePath}`);
+              }
+
+              return download(filePath, download_url).then(() => {
+                console.log(`${LOG_TAG} \tmempool-promo.mp4 downloaded.`);
+              });
+            });
+          }, Promise.resolve())
+            .then(resolve)
+            .catch(reject);
+
         } catch (e) {
           reject(`Unable to download video. Trying again at next restart. Reason: ${e instanceof Error ? e.message : e}`);
         }
       });
 
-      response.on('error', (error) => {
-        reject(error);
-      });
+      response.on('error', reject);
     });
   });
-
 }
-
 
 if (configContent.BASE_MODULE && configContent.BASE_MODULE === 'liquid') {
   const assetsJsonUrl = 'https://raw.githubusercontent.com/Blockstream/asset_registry_db/master/index.json';
@@ -411,3 +447,4 @@ if (configContent.BASE_MODULE && configContent.BASE_MODULE === 'liquid') {
     throw new Error(error);
   });
 })();
+
